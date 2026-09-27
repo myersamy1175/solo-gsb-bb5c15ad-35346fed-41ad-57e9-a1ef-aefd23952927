@@ -3,6 +3,13 @@
 from __future__ import annotations
 
 from .normalize import Issue, IssueCode, IssueSeverity, NormalizedEntry, normalize_entry
+from .audit import (
+    AuditEntry,
+    audit_manifests,
+    AmbiguousKey,
+    HierarchyBlocked,
+    AuditPair,
+)
 from .mirror import MirrorOperation, plan_mirror
 from .overlay import (
     OverlayNodeSource,
@@ -18,6 +25,13 @@ from .schemas import (
     CollisionMember,
     EntryType,
     HierarchyConflict,
+    ManifestAmbiguousKeyOut,
+    ManifestAuditPair,
+    ManifestAuditRequest,
+    ManifestAuditResponse,
+    ManifestAuditSummary,
+    ManifestEntryRef,
+    ManifestHierarchyBlockedOut,
     MirrorPreviewRequest,
     MirrorPreviewResponse,
     MirrorStepOut,
@@ -432,4 +446,88 @@ def run_mirror_preview(request: MirrorPreviewRequest) -> MirrorPreviewResponse:
     )
     return MirrorPreviewResponse(
         target="windows", steps=steps_out, summary=summary
+    )
+
+
+def run_manifest_audit(request: ManifestAuditRequest) -> ManifestAuditResponse:
+    """约定清单与交付清单核对（纯内存，只比较声明 SHA-256，不读取文件内容）。
+
+    两侧不安全路径已在请求模型校验阶段以 422 拒绝；同键重复不在此拒绝，
+    由 :func:`app.audit.audit_manifests` 整键列为歧义。
+    """
+
+    def _normalize_side(side_entries):
+        prepared = []
+        for i, entry in enumerate(side_entries, start=1):
+            normalized = normalize_entry(
+                index=i, entry_type=entry.type.value, original_path=entry.path
+            )
+            sha = entry.sha256.lower() if entry.sha256 is not None else None
+            prepared.append((normalized, sha))
+        return prepared
+
+    result = audit_manifests(
+        _normalize_side(request.agreed),
+        _normalize_side(request.delivered),
+    )
+
+    def _ref(entry: AuditEntry) -> ManifestEntryRef:
+        return ManifestEntryRef(
+            side=entry.side,
+            index=entry.index,
+            type=OverlayEntryType(entry.entry_type),
+            original_path=entry.original_path,
+            canonical_path=entry.canonical_path,
+            comparison_key=entry.comparison_key,
+            sha256=entry.sha256,
+        )
+
+    def _pair_out(pair: AuditPair) -> ManifestAuditPair:
+        return ManifestAuditPair(
+            status=pair.status,
+            comparison_key=pair.comparison_key,
+            agreed=_ref(pair.agreed),
+            delivered=_ref(pair.delivered),
+        )
+
+    def _blocked_out(item: HierarchyBlocked) -> ManifestHierarchyBlockedOut:
+        return ManifestHierarchyBlockedOut(
+            entry=_ref(item.entry),
+            blocked_by=_ref(item.blocked_by),
+            additional_blocked_by=[_ref(b) for b in item.additional_blocked_by],
+        )
+
+    def _ambiguous_out(item: AmbiguousKey) -> ManifestAmbiguousKeyOut:
+        return ManifestAmbiguousKeyOut(
+            comparison_key=item.comparison_key,
+            canonical_path=item.canonical_path,
+            agreed=[_ref(e) for e in item.agreed],
+            delivered=[_ref(e) for e in item.delivered],
+        )
+
+    ambiguous_entries = sum(
+        len(k.agreed) + len(k.delivered) for k in result.ambiguous_keys
+    )
+    summary = ManifestAuditSummary(
+        agreed_total=len(request.agreed),
+        delivered_total=len(request.delivered),
+        matched=len(result.matched),
+        missing=len(result.missing),
+        extra=len(result.extra),
+        type_mismatches=len(result.type_mismatches),
+        digest_mismatches=len(result.digest_mismatches),
+        hierarchy_blocked=len(result.hierarchy_blocked),
+        ambiguous_keys=len(result.ambiguous_keys),
+        ambiguous_entries=ambiguous_entries,
+    )
+    return ManifestAuditResponse(
+        target="windows",
+        matched=[_pair_out(p) for p in result.matched],
+        type_mismatches=[_pair_out(p) for p in result.type_mismatches],
+        digest_mismatches=[_pair_out(p) for p in result.digest_mismatches],
+        missing=[_ref(e) for e in result.missing],
+        extra=[_ref(e) for e in result.extra],
+        hierarchy_blocked=[_blocked_out(h) for h in result.hierarchy_blocked],
+        ambiguous_keys=[_ambiguous_out(k) for k in result.ambiguous_keys],
+        summary=summary,
     )

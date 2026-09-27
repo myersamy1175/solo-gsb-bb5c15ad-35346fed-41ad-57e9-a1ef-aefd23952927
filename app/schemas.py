@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import re
 from enum import Enum
 
 from pydantic import BaseModel, Field, model_validator
 
+from .audit import AuditDifference, ManifestSide, validate_manifest_side
 from .normalize import IssueCode, IssueSeverity, normalize_entry
 from .mirror import MirrorOperation
 from .overlay import (
@@ -559,6 +561,158 @@ class MirrorPreviewResponse(BaseModel):
     target: str = "windows"
     steps: list[MirrorStepOut]
     summary: MirrorSummary
+
+
+# ---------------------------------------------------------------------------
+# manifest-audit：约定清单 vs 交付清单核对
+# ---------------------------------------------------------------------------
+
+_SHA256_HEX_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+class ManifestEntryIn(BaseModel):
+    path: str = Field(..., description="清单条目的相对路径（原始形式，复用 Windows 规范化规则）")
+    type: OverlayEntryType = Field(..., description="条目类型：file 或 directory（不接受 symlink）")
+    sha256: str | None = Field(
+        default=None,
+        description=(
+            "声明的 SHA-256 摘要（64 位十六进制，大小写不敏感）；"
+            "file 条目必须提供，directory 条目不得携带"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_sha256(self) -> "ManifestEntryIn":
+        if self.type is OverlayEntryType.FILE:
+            if self.sha256 is None:
+                raise ValueError("file 条目必须提供声明的 sha256")
+            if not _SHA256_HEX_RE.match(self.sha256):
+                raise ValueError("sha256 必须是 64 位十六进制字符串")
+        elif self.sha256 is not None:
+            raise ValueError("仅 file 条目可携带 sha256")
+        return self
+
+
+class ManifestAuditRequest(BaseModel):
+    """约定清单与交付清单核对请求（两侧均可为空）。"""
+
+    agreed: list[ManifestEntryIn] = Field(
+        default_factory=list,
+        description=(
+            "约定清单（file/directory，文件必须声明 SHA-256）；"
+            "含不安全路径（绝对/UNC/盘符/越界 ../保留名/非法字符等）时返回 422"
+        ),
+    )
+    delivered: list[ManifestEntryIn] = Field(
+        default_factory=list,
+        description="交付清单（规则同约定清单）；含不安全路径时返回 422",
+    )
+
+    @model_validator(mode="after")
+    def _reject_unsafe_paths(self) -> "ManifestAuditRequest":
+        validate_manifest_side(
+            [
+                normalize_entry(index=i, entry_type=e.type.value, original_path=e.path)
+                for i, e in enumerate(self.agreed, start=1)
+            ],
+            ManifestSide.AGREED,
+        )
+        validate_manifest_side(
+            [
+                normalize_entry(index=i, entry_type=e.type.value, original_path=e.path)
+                for i, e in enumerate(self.delivered, start=1)
+            ],
+            ManifestSide.DELIVERED,
+        )
+        return self
+
+
+class ManifestEntryRef(BaseModel):
+    """清单条目引用：保留原下标与规范路径。"""
+
+    side: ManifestSide = Field(..., description="来源清单：agreed（约定）或 delivered（交付）")
+    index: int = Field(..., description="原清单下标（从 1 开始）")
+    type: OverlayEntryType
+    original_path: str = Field(..., description="原始输入路径")
+    canonical_path: str = Field(..., description="规范路径（NFC、段尾已裁剪，正斜杠分隔）")
+    comparison_key: str = Field(..., description="Windows 等价比较键（小写折叠）")
+    sha256: str | None = Field(
+        ...,
+        description=(
+            "声明的 SHA-256 摘要（归一为小写十六进制，仅 file 条目有值）；"
+            "服务只比较声明摘要，不读取文件内容"
+        ),
+    )
+
+
+class ManifestAuditPair(BaseModel):
+    """同键唯一条目对的核对结果。"""
+
+    status: AuditDifference = Field(
+        ...,
+        description=(
+            "MATCH（一致：类型相同，文件摘要也相同）、"
+            "TYPE_MISMATCH（类型不符）或 DIGEST_MISMATCH（文件声明摘要不符）"
+        ),
+    )
+    comparison_key: str = Field(..., description="Windows 等价比较键（小写折叠）")
+    agreed: ManifestEntryRef
+    delivered: ManifestEntryRef
+
+
+class ManifestHierarchyBlockedOut(BaseModel):
+    """被另一侧文件祖先阻挡的单侧条目（非普通缺失/额外）。"""
+
+    entry: ManifestEntryRef = Field(..., description="被阻挡条目")
+    blocked_by: ManifestEntryRef = Field(
+        ..., description="占据祖先路径的另一侧文件（多个祖先文件时为最近/最深层者）"
+    )
+    additional_blocked_by: list[ManifestEntryRef] = Field(
+        default_factory=list,
+        description="其余同样占据祖先路径的另一侧文件（由近及远，无则为空）",
+    )
+
+
+class ManifestAmbiguousKeyOut(BaseModel):
+    """单侧同键重复的歧义键。"""
+
+    comparison_key: str = Field(..., description="发生重复的 Windows 比较键")
+    canonical_path: str = Field(..., description="该键的规范路径（展示用，优先取约定侧首个成员）")
+    agreed: list[ManifestEntryRef] = Field(
+        default_factory=list, description="约定侧该键的全部成员（按下标升序）"
+    )
+    delivered: list[ManifestEntryRef] = Field(
+        default_factory=list, description="交付侧该键的全部成员（按下标升序）"
+    )
+
+
+class ManifestAuditSummary(BaseModel):
+    agreed_total: int = Field(..., description="约定清单条目总数")
+    delivered_total: int = Field(..., description="交付清单条目总数")
+    matched: int = Field(..., description="一致（类型与文件摘要均相同）的键数")
+    missing: int = Field(..., description="缺失条目数（约定有、交付无且未被层级阻挡）")
+    extra: int = Field(..., description="额外条目数（交付有、约定无且未被层级阻挡）")
+    type_mismatches: int = Field(..., description="类型不符的键数")
+    digest_mismatches: int = Field(..., description="文件声明摘要不符的键数")
+    hierarchy_blocked: int = Field(..., description="层级阻挡条目数")
+    ambiguous_keys: int = Field(..., description="歧义键数量")
+    ambiguous_entries: int = Field(..., description="歧义键涉及的两侧成员条目总数")
+
+
+class ManifestAuditResponse(BaseModel):
+    target: str = "windows"
+    matched: list[ManifestAuditPair] = Field(..., description="一致条目对（按比较键排序）")
+    type_mismatches: list[ManifestAuditPair] = Field(..., description="类型不符条目对（按比较键排序）")
+    digest_mismatches: list[ManifestAuditPair] = Field(..., description="摘要不符条目对（按比较键排序）")
+    missing: list[ManifestEntryRef] = Field(..., description="缺失条目（按比较键稳定排序）")
+    extra: list[ManifestEntryRef] = Field(..., description="额外条目（按比较键稳定排序）")
+    hierarchy_blocked: list[ManifestHierarchyBlockedOut] = Field(
+        ..., description="层级阻挡条目（按被阻挡条目比较键稳定排序，含阻挡文件下标）"
+    )
+    ambiguous_keys: list[ManifestAmbiguousKeyOut] = Field(
+        ..., description="单侧同键重复的歧义键（按比较键排序，成员全部列出不配对）"
+    )
+    summary: ManifestAuditSummary
 
 
 class HealthResponse(BaseModel):

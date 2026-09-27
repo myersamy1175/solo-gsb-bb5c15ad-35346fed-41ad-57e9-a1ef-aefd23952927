@@ -11,7 +11,11 @@
 另有**目标目录覆盖预演**接口：给定目标目录现存清单与按顺序解包的清单，
 在内存中的虚拟目录树上逐条干跑，预判每个条目将是新建、覆盖、目录复用还是被阻挡；
 以及**目录镜像同步预演**接口：给定现存布局与期望归档布局，只在内存中生成
-把现存布局同步为期望布局的完整操作序列（删除多余/类型互换节点、建目录、写文件）。
+把现存布局同步为期望布局的完整操作序列（删除多余/类型互换节点、建目录、写文件）；
+还有**约定/交付清单核对**接口：按 Windows 比较键核对两侧 `file`/`directory`
+清单的缺失、额外、类型不符、SHA-256 摘要不符与一致，单侧同键重复整键列为歧义，
+另一侧文件占据祖先路径的条目归为层级阻挡；**只比较文件声明的 SHA-256，不读取
+文件内容**。
 
 > 服务**只对路径字符串做词法分析，全程不访问文件系统**，不会读取或写入任何条目。
 
@@ -259,6 +263,77 @@ curl -s http://localhost:8000/api/v1/mirror-preview \
 上例返回的操作序列（节选）：先深 → 浅删除多余的 `junk.tmp`，再保留隐含
 目录 `docs`，最后按 incoming 顺序覆盖 `docs/readme.txt`、新建
 `docs/new.md`。
+
+### `POST /api/v1/manifest-audit`
+
+约定清单（`agreed`）与交付清单（`delivered`）核对：两侧均为相对路径的
+`file` / `directory` 条目（不接受 `symlink`），**文件条目必须声明 SHA-256**
+（64 位十六进制，大小写不敏感，响应中归一为小写）；目录条目不得携带 `sha256`。
+服务只比较**声明摘要**，全程纯内存计算，**不读取任何文件内容**，也不访问文件系统。
+两侧清单均可省略或为空。
+
+- **路径规范化**：两侧路径复用与预检接口相同的 Windows 规范化规则
+  （分隔符统一、NFC、段尾裁剪、保留名/非法字符检查、词法遍历），比较键为
+  `casefold` 折叠后的规范路径。
+- **不安全路径返回 422**：任一条目命中绝对/UNC/盘符路径、越界 `..`、保留设备名、
+  非法字符或规范化后为空（与 overlay/mirror 的不安全判定一致），整个请求
+  返回 422（错误信息标注来源清单与下标）。
+- **同键唯一成对比对**：同键在两侧各只有 1 条时——
+  类型不同 → `type_mismatches`；均为文件且声明摘要不同 → `digest_mismatches`；
+  其余（同类型目录，或同类型文件且摘要一致）→ `matched`。
+- **单侧同键重复 → 整键歧义**：某键在约定侧或交付侧出现 2 条及以上（大小写/
+  NFC/段尾差异抹平后同键）时，该键**整体列入 `ambiguous_keys`**，两侧成员全部
+  列出且**不做任意配对**——即使另一侧只有 1 条，也不会任选一个成员比对，
+  该键不产生匹配/缺失/额外/类型/摘要结果。
+- **层级阻挡**：某键只在一侧存在时，若另一侧有**文件**条目占据其祖先路径
+  （如交付清单把 `a/b` 列为文件，而约定清单有 `a/b/c.txt`），该后代条目列入
+  `hierarchy_blocked` 而非普通 `missing`/`extra`，并在 `blocked_by` 中指明
+  阻挡文件（来源侧、原下标与规范路径）；祖先上存在多个文件时，`blocked_by`
+  取**最近（最深层）**的阻挡文件，其余由近及远列入 `additional_blocked_by`。
+  祖先为目录属正常布局，不构成阻挡；阻挡文件自身若在另一侧没有同键条目，
+  仍按普通缺失/额外计。
+
+请求体示例：
+
+```json
+{
+  "agreed": [
+    { "path": "docs/readme.txt", "type": "file", "sha256": "aa…（64 位十六进制）" },
+    { "path": "assets", "type": "directory" },
+    { "path": "assets/logo.png", "type": "file", "sha256": "bb…" }
+  ],
+  "delivered": [
+    { "path": "Docs\\ReadMe.txt", "type": "file", "sha256": "AA…（大小写不敏感）" },
+    { "path": "assets", "type": "directory" },
+    { "path": "assets/logo.png", "type": "file", "sha256": "cc…（摘要不符）" }
+  ]
+}
+```
+
+响应分类（均为数组；条目引用保留 `side`（`agreed`/`delivered`）、双方
+**原下标**（从 1 开始）、`original_path`、`canonical_path`、`comparison_key`
+与文件的声明 `sha256`；所有列表均按比较键稳定排序，与输入顺序无关）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `matched` | 一致条目对（`status=MATCH`）：类型相同，且文件条目的声明 SHA-256 相同 |
+| `type_mismatches` | 类型不符条目对（`status=TYPE_MISMATCH`，file ↔ directory） |
+| `digest_mismatches` | 同键文件条目对声明摘要不符（`status=DIGEST_MISMATCH`） |
+| `missing` | 缺失条目：仅约定侧存在、未被交付侧文件祖先阻挡 |
+| `extra` | 额外条目：仅交付侧存在、未被约定侧文件祖先阻挡 |
+| `hierarchy_blocked` | 层级阻挡条目：仅单侧存在但被另一侧文件祖先占据；`blocked_by` 为最近阻挡文件，`additional_blocked_by` 为其余更远的阻挡文件 |
+| `ambiguous_keys` | 歧义键：单侧（或两侧）同键重复；`agreed` / `delivered` 列出该键全部成员，不配对 |
+| `summary` | `agreed_total / delivered_total / matched / missing / extra / type_mismatches / digest_mismatches / hierarchy_blocked / ambiguous_keys / ambiguous_entries` 计数 |
+
+curl 示例（服务监听宿主机 **8000** 端口）：
+
+```bash
+curl -s http://localhost:8000/api/v1/manifest-audit \
+  -H 'Content-Type: application/json' \
+  -d '{"agreed":[{"path":"readme.txt","type":"file","sha256":"'"$(printf 'a%.0s' {1..64})"'"}],"delivered":[{"path":"ReadMe.TXT ","type":"file","sha256":"'"$(printf 'A%.0s' {1..64})"'"}]}'
+```
+
+上例两条目经 Windows 规范化后同键、摘要忽略大小写，故 `matched` 为 1。
 
 ## 规范化规则（Windows 目标）
 
@@ -550,15 +625,16 @@ curl -s http://localhost:8000/api/v1/preflight \
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由（/health、/api/v1/preflight、/api/v1/overlay-preview、/api/v1/mirror-preview）
+│   ├── main.py          # FastAPI 路由（/health、/api/v1/preflight、/api/v1/overlay-preview、/api/v1/mirror-preview、/api/v1/manifest-audit）
 │   ├── normalize.py     # Windows 路径规范化与 unsafe 判定（纯函数）
-│   ├── schemas.py       # Pydantic 请求/响应模型（含 repair_plan、symlink_analysis、resource_limits、overlay-preview、mirror-preview）
-│   ├── service.py       # 碰撞分组、层级冲突、资源预算、符号链接分析、覆盖预演与镜像同步预演编排
+│   ├── schemas.py       # Pydantic 请求/响应模型（含 repair_plan、symlink_analysis、resource_limits、overlay-preview、mirror-preview、manifest-audit）
+│   ├── service.py       # 碰撞分组、层级冲突、资源预算、符号链接分析、覆盖预演、镜像同步预演与清单核对编排
 │   ├── symlink.py       # 符号链接风险分析：目标越界、链接链循环、路径劫持（纯函数）
 │   ├── resource.py      # 解压资源预算校验：单文件/整批解压大小、整数交叉乘法压缩比（纯函数）
 │   ├── selection.py     # selection_rules glob 匹配（*、? 按段，** 跨多级）与 include/exclude 筛选（纯函数）
 │   ├── overlay.py       # 目标目录覆盖预演：清单校验、虚拟目录树与按序干跑（纯函数）
 │   ├── mirror.py        # 目录镜像同步预演：三阶段操作序列（删除→建目录→写文件，纯函数）
+│   ├── audit.py         # 约定/交付清单核对：缺失/额外/类型/摘要/一致、歧义键与层级阻挡（纯函数，不读文件内容）
 │   └── repair.py        # repair=true 确定性改名修复计划（纯函数）
 ├── tests/               # pytest 用例
 ├── docker/entrypoint.sh # 启动时安装依赖并启动服务
