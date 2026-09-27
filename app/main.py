@@ -9,6 +9,8 @@ from fastapi import FastAPI
 
 from .schemas import (
     HealthResponse,
+    ManifestAuditRequest,
+    ManifestAuditResponse,
     MirrorPreviewRequest,
     MirrorPreviewResponse,
     OverlayPreviewRequest,
@@ -16,7 +18,12 @@ from .schemas import (
     PreflightRepairResponse,
     PreflightRequest,
 )
-from .service import run_mirror_preview, run_overlay_preview, run_preflight
+from .service import (
+    run_manifest_audit,
+    run_mirror_preview,
+    run_overlay_preview,
+    run_preflight,
+)
 
 app = FastAPI(
     title="Archive Path Preflight API",
@@ -28,10 +35,12 @@ app = FastAPI(
         " 在预检前按规范化路径 glob 筛选实际解包条目；目标目录覆盖预演"
         "（按现存清单与解包顺序干跑 CREATE/OVERWRITE/REUSE_DIRECTORY/BLOCKED）；"
         "目录镜像同步预演（把现存布局同步为期望归档布局，纯内存生成"
-        " DELETE/KEEP_DIRECTORY/CREATE_DIRECTORY/OVERWRITE_FILE/CREATE_FILE 操作序列）。"
+        " DELETE/KEEP_DIRECTORY/CREATE_DIRECTORY/OVERWRITE_FILE/CREATE_FILE 操作序列）；"
+        "清单核对（约定清单 vs 交付清单：缺失、额外、类型不符、摘要不符、"
+        "一致、层级阻挡与同键歧义，仅比较声明 SHA-256）。"
         "纯内存计算，不访问文件系统。"
     ),
-    version="1.5.0",
+    version="1.6.0",
 )
 
 
@@ -49,6 +58,7 @@ def root() -> dict[str, str]:
         "preflight": "POST /api/v1/preflight",
         "overlay_preview": "POST /api/v1/overlay-preview",
         "mirror_preview": "POST /api/v1/mirror-preview",
+        "manifest_audit": "POST /api/v1/manifest-audit",
     }
 
 
@@ -81,3 +91,13 @@ def overlay_preview(request: OverlayPreviewRequest) -> OverlayPreviewResponse:
 )
 def mirror_preview(request: MirrorPreviewRequest) -> MirrorPreviewResponse:
     return run_mirror_preview(request)
+
+
+@app.post(
+    "/api/v1/manifest-audit",
+    response_model=ManifestAuditResponse,
+    tags=["audit"],
+    summary="清单核对：约定清单 vs 交付清单（缺失/额外/类型/摘要/层级阻挡/歧义，仅比较声明摘要）",
+)
+def manifest_audit(request: ManifestAuditRequest) -> ManifestAuditResponse:
+    return run_manifest_audit(request)

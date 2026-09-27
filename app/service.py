@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .normalize import Issue, IssueCode, IssueSeverity, NormalizedEntry, normalize_entry
+from .audit import AuditEntry, audit_manifests
 from .mirror import MirrorOperation, plan_mirror
 from .overlay import (
     OverlayNodeSource,
@@ -18,6 +19,15 @@ from .schemas import (
     CollisionMember,
     EntryType,
     HierarchyConflict,
+    ManifestAmbiguousKeyOut,
+    ManifestAuditEntryOut,
+    ManifestAuditRequest,
+    ManifestAuditResponse,
+    ManifestAuditSummary,
+    ManifestBlockerOut,
+    ManifestEntryRef,
+    ManifestHierarchyBlockedOut,
+    ManifestPairOut,
     MirrorPreviewRequest,
     MirrorPreviewResponse,
     MirrorStepOut,
@@ -432,4 +442,129 @@ def run_mirror_preview(request: MirrorPreviewRequest) -> MirrorPreviewResponse:
     )
     return MirrorPreviewResponse(
         target="windows", steps=steps_out, summary=summary
+    )
+
+
+def _normalize_audit_side(
+    entries,
+) -> tuple[list[NormalizedEntry], dict[int, str]]:
+    """规范化单侧清单并收集文件声明摘要（统一小写）。
+
+    路径安全性与摘要存在性/格式已在请求模型校验阶段保证（否则 422）。
+    """
+    normalized = [
+        normalize_entry(index=i, entry_type=e.type.value, original_path=e.path)
+        for i, e in enumerate(entries, start=1)
+    ]
+    digests = {
+        i: entry.sha256.lower()
+        for i, entry in enumerate(entries, start=1)
+        if entry.sha256 is not None
+    }
+    return normalized, digests
+
+
+def _audit_entry_ref(entry: AuditEntry) -> ManifestEntryRef:
+    return ManifestEntryRef(
+        side=entry.side,
+        index=entry.index,
+        type=OverlayEntryType(entry.entry_type),
+        original_path=entry.original_path,
+        canonical_path=entry.canonical_path,
+        comparison_key=entry.comparison_key,
+        sha256=entry.sha256,
+    )
+
+
+def _audit_pair_out(finding) -> ManifestPairOut:
+    return ManifestPairOut(
+        status=finding.status,
+        comparison_key=finding.comparison_key,
+        agreed=_audit_entry_ref(finding.agreed) if finding.agreed is not None else None,
+        delivered=(
+            _audit_entry_ref(finding.delivered)
+            if finding.delivered is not None
+            else None
+        ),
+    )
+
+
+def run_manifest_audit(request: ManifestAuditRequest) -> ManifestAuditResponse:
+    """核对约定清单与交付清单（纯内存，只比较声明摘要，不读文件内容）。
+
+    两侧清单已在请求模型校验阶段完成路径安全与文件摘要校验（否则 422）。
+    """
+    agreed, agreed_digests = _normalize_audit_side(request.agreed)
+    delivered, delivered_digests = _normalize_audit_side(request.delivered)
+
+    result = audit_manifests(
+        agreed=agreed,
+        delivered=delivered,
+        agreed_digests=agreed_digests,
+        delivered_digests=delivered_digests,
+    )
+
+    agreed_out = [
+        ManifestAuditEntryOut(**_audit_entry_ref(entry).model_dump())
+        for entry in result.agreed_entries
+    ]
+    delivered_out = [
+        ManifestAuditEntryOut(**_audit_entry_ref(entry).model_dump())
+        for entry in result.delivered_entries
+    ]
+
+    hierarchy_out = [
+        ManifestHierarchyBlockedOut(
+            blocked=_audit_entry_ref(item.blocked),
+            blockers=[
+                ManifestBlockerOut(
+                    side=blocker.side,
+                    index=blocker.index,
+                    canonical_path=blocker.canonical_path,
+                    comparison_key=blocker.comparison_key,
+                    sha256=blocker.sha256,
+                )
+                for blocker in item.blockers
+            ],
+        )
+        for item in result.hierarchy_blocked
+    ]
+
+    ambiguous_out = [
+        ManifestAmbiguousKeyOut(
+            comparison_key=item.comparison_key,
+            agreed=[_audit_entry_ref(entry) for entry in item.agreed],
+            delivered=[_audit_entry_ref(entry) for entry in item.delivered],
+        )
+        for item in result.ambiguous_keys
+    ]
+
+    ambiguous_entry_count = sum(
+        len(item.agreed) + len(item.delivered) for item in result.ambiguous_keys
+    )
+    summary = ManifestAuditSummary(
+        agreed_total=len(result.agreed_entries),
+        delivered_total=len(result.delivered_entries),
+        missing=len(result.missing),
+        extra=len(result.extra),
+        type_mismatches=len(result.type_mismatches),
+        digest_mismatches=len(result.digest_mismatches),
+        matched=len(result.matched),
+        hierarchy_blocked=len(result.hierarchy_blocked),
+        ambiguous_keys=len(result.ambiguous_keys),
+        ambiguous_entries=ambiguous_entry_count,
+    )
+
+    return ManifestAuditResponse(
+        target="windows",
+        agreed_entries=agreed_out,
+        delivered_entries=delivered_out,
+        missing=[_audit_pair_out(item) for item in result.missing],
+        extra=[_audit_pair_out(item) for item in result.extra],
+        type_mismatches=[_audit_pair_out(item) for item in result.type_mismatches],
+        digest_mismatches=[_audit_pair_out(item) for item in result.digest_mismatches],
+        matched=[_audit_pair_out(item) for item in result.matched],
+        hierarchy_blocked=hierarchy_out,
+        ambiguous_keys=ambiguous_out,
+        summary=summary,
     )

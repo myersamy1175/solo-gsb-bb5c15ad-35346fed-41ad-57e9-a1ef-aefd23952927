@@ -11,7 +11,10 @@
 另有**目标目录覆盖预演**接口：给定目标目录现存清单与按顺序解包的清单，
 在内存中的虚拟目录树上逐条干跑，预判每个条目将是新建、覆盖、目录复用还是被阻挡；
 以及**目录镜像同步预演**接口：给定现存布局与期望归档布局，只在内存中生成
-把现存布局同步为期望布局的完整操作序列（删除多余/类型互换节点、建目录、写文件）。
+把现存布局同步为期望布局的完整操作序列（删除多余/类型互换节点、建目录、写文件）；
+另有**清单核对**接口：给定约定清单与交付清单（条目含相对路径、`file`/`directory`
+类型与文件声明的 SHA-256），按 Windows 比较键核对缺失、额外、类型不符、摘要不符
+与一致，单侧同键重复整键列为歧义，一侧文件占据另一侧条目祖先路径时归为层级阻挡。
 
 > 服务**只对路径字符串做词法分析，全程不访问文件系统**，不会读取或写入任何条目。
 
@@ -259,6 +262,102 @@ curl -s http://localhost:8000/api/v1/mirror-preview \
 上例返回的操作序列（节选）：先深 → 浅删除多余的 `junk.tmp`，再保留隐含
 目录 `docs`，最后按 incoming 顺序覆盖 `docs/readme.txt`、新建
 `docs/new.md`。
+
+### `POST /api/v1/manifest-audit`
+
+清单核对：给定**约定清单**（`agreed`，期望内容）与**交付清单**
+（`delivered`，实际内容），按 Windows 比较键逐条核对两份清单的差异。
+全程纯内存词法计算，**只比较双方声明的 SHA-256，绝不读取文件内容**。
+两侧条目均为相对路径 + `file` / `directory` 类型；`file` 条目**必须**声明
+`sha256`（64 位十六进制，大小写不敏感），`directory` 不得携带。
+
+请求体示例：
+
+```json
+{
+  "agreed": [
+    { "path": "docs/readme.txt", "type": "file", "sha256": "aa…aa" },
+    { "path": "docs/missing.txt", "type": "file", "sha256": "12…34" },
+    { "path": "assets", "type": "directory" },
+    { "path": "assets/logo.png", "type": "file", "sha256": "56…78" }
+  ],
+  "delivered": [
+    { "path": "docs/readme.txt", "type": "file", "sha256": "AA…AA" },
+    { "path": "assets", "type": "directory" },
+    { "path": "assets/logo.png", "type": "file", "sha256": "9a…bc" },
+    { "path": "extra.bin", "type": "file", "sha256": "de…f0" },
+    { "path": "pkg", "type": "file", "sha256": "11…22" },
+    { "path": "pkg/inner.dat", "type": "file", "sha256": "33…44" }
+  ]
+}
+```
+
+核对规则：
+
+- **路径规范化**：两侧路径均复用与预检接口相同的 Windows 规范化规则
+  （分隔符统一、NFC、段尾裁剪、保留名/非法字符检查、词法遍历），
+  比较键为 `casefold` 折叠后的规范路径（`Docs\ReadMe.TXT` 与
+  `docs/readme.txt` 视为同键）。**含不安全路径的请求整体返回 422**。
+- **单侧同键重复 → 歧义（`ambiguous_keys`）**：任一侧同一比较键出现多条
+  条目时，**整键列为歧义**，列出双方该键的全部成员，**不与另一侧任意配对**
+  （不进入缺失/额外/类型/摘要/一致中的任何一类）。歧义键上的文件成员仍会
+  作为另一侧后代的阻挡文件出现。
+- 其余非歧义键按比较键逐条核对：
+
+  | 结论 | 条件 |
+  | --- | --- |
+  | `missing`（缺失） | 仅约定侧有该键 |
+  | `extra`（额外） | 仅交付侧有该键 |
+  | `type_mismatches`（类型不符） | 两侧同键但类型不同（file vs directory） |
+  | `digest_mismatches`（摘要不符） | 两侧同键均为文件但声明 SHA-256 不同 |
+  | `matched`（一致） | 两侧同键同类型；文件还要求 SHA-256 一致，目录不比较摘要 |
+
+- **层级阻挡（`hierarchy_blocked`）**：一侧的**文件**占据另一侧某条目
+  比较键的**祖先路径**时（如交付侧有文件 `pkg`，约定侧有条目
+  `pkg/inner.dat`），后代条目录为层级阻挡并指明阻挡文件，**而非普通缺失
+  或额外**；被阻挡条目不参与同键配对（另一侧该键按缺失/额外处理）。
+  阻挡文件自身在其自身键上的核对结论保持不变（上例中 `pkg` 仍为额外）。
+  一条后代可被多个祖先文件阻挡，`blockers` 按**由近及远**（祖先深度降序）、
+  同深度按下标排列。**目录**占据祖先路径属于正常布局，不构成阻挡；
+  阻挡只发生在两侧之间（单侧内部的文件祖先既不拒绝也不跨侧阻挡）。
+- 与 overlay/mirror 接口不同：单侧同键重复与单侧文件祖先在本接口**不返回
+  422**，而是分别归入歧义与层级阻挡结论。
+
+请求校验（422）：路径不安全（绝对/UNC/盘符路径、越界 `..`、保留设备名、
+非法字符、空目标等）、文件缺少 `sha256`、`sha256` 不是 64 位十六进制、
+目录携带 `sha256`、类型不是 `file` / `directory`，均返回 422。
+
+响应结构：
+
+- `agreed_entries` / `delivered_entries`：两侧全部条目的规范化回显，
+  **保持原清单下标顺序**（`index` 从 1 开始），每条含 `side`、`index`、
+  `type`、`original_path`、`canonical_path`、`comparison_key` 与小写化的
+  `sha256`（目录为 `null`）。
+- `missing` / `extra` / `type_mismatches` / `digest_mismatches` / `matched`：
+  配对结论列表，**均按比较键稳定升序**；每条含 `status`、`comparison_key`
+  以及两侧条目引用 `agreed` / `delivered`（缺失时 `delivered` 为 `null`，
+  额外时 `agreed` 为 `null`）。
+- `hierarchy_blocked`：层级阻挡列表，按被阻挡后代比较键升序（同键时约定侧
+  在前）；每条含 `blocked`（被阻挡后代条目引用）与 `blockers`（阻挡文件
+  列表，含 `side`、`index`、`canonical_path`、`comparison_key`、`sha256`）。
+- `ambiguous_keys`：歧义键列表（按比较键升序），每条含 `comparison_key` 与
+  双方该键的成员列表 `agreed` / `delivered`（成员按下标顺序，另一侧无成员
+  时为空列表），**不任意配对**。
+- `summary`：`agreed_total` / `delivered_total` / `missing` / `extra` /
+  `type_mismatches` / `digest_mismatches` / `matched` / `hierarchy_blocked` /
+  `ambiguous_keys` / `ambiguous_entries`（歧义键涉及的双侧条目总数）。
+
+两侧清单均可省略或为空（空清单视为零条目，两侧皆空时各结论列表为空）。
+
+curl 示例（服务监听宿主机 **8000** 端口）：
+
+```bash
+curl -s http://localhost:8000/api/v1/manifest-audit \
+  -H 'Content-Type: application/json' \
+  -d '{"agreed":[{"path":"docs/readme.txt","type":"file","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],"delivered":[{"path":"docs/readme.txt","type":"file","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]}'
+```
+
+上例中两侧文件同键但 SHA-256 不同，结论进入 `digest_mismatches`。
 
 ## 规范化规则（Windows 目标）
 
@@ -550,10 +649,11 @@ curl -s http://localhost:8000/api/v1/preflight \
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由（/health、/api/v1/preflight、/api/v1/overlay-preview、/api/v1/mirror-preview）
+│   ├── main.py          # FastAPI 路由（/health、/api/v1/preflight、/api/v1/overlay-preview、/api/v1/mirror-preview、/api/v1/manifest-audit）
 │   ├── normalize.py     # Windows 路径规范化与 unsafe 判定（纯函数）
-│   ├── schemas.py       # Pydantic 请求/响应模型（含 repair_plan、symlink_analysis、resource_limits、overlay-preview、mirror-preview）
-│   ├── service.py       # 碰撞分组、层级冲突、资源预算、符号链接分析、覆盖预演与镜像同步预演编排
+│   ├── schemas.py       # Pydantic 请求/响应模型（含 repair_plan、symlink_analysis、resource_limits、overlay-preview、mirror-preview、manifest-audit）
+│   ├── service.py       # 碰撞分组、层级冲突、资源预算、符号链接分析、覆盖预演、镜像同步预演与清单核对编排
+│   ├── audit.py         # 清单核对：缺失/额外/类型不符/摘要不符/一致、层级阻挡与同键歧义（纯函数）
 │   ├── symlink.py       # 符号链接风险分析：目标越界、链接链循环、路径劫持（纯函数）
 │   ├── resource.py      # 解压资源预算校验：单文件/整批解压大小、整数交叉乘法压缩比（纯函数）
 │   ├── selection.py     # selection_rules glob 匹配（*、? 按段，** 跨多级）与 include/exclude 筛选（纯函数）
